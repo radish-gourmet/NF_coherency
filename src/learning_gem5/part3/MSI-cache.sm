@@ -398,11 +398,20 @@ machine(MachineType:L1Cache, "MSI cache")
                 } else if (in_msg.Type == CoherenceRequestType:GetM) {
                     trigger(Event:FwdGetM, in_msg.addr, cache_entry, tbe);
                 } else if (in_msg.Type == CoherenceRequestType:Inv) {
-                    if (((((in_msg.addr & 0x0000000000000020) >> 5) == 1) && cache_entry.Coh_mask[1] == true) || ((((address & 0x0000000000000020) >> 5) == 0) && cache_entry.Coh_mask[0] == true)) {
-                        trigger(Event:InvMatch, in_msg.LineAddress, cache_entry, tbe);
+                    if((cache_entry.Coh_mask[1] == True) && (cache_entry.Coh_mask[0] == True) ) {
+                        if(in_msg.Coh_mask[0] == False || in_msg.Coh_mask[1] == False){
+                            //InvMMS -> Invalidate with mismatch, but stay in shared state
+                            trigger(Event:InvMMS, in_msg.LineAddress, cache_entry, tbe);
+                        }
                     }
                     else {
-                        trigger(Event:InvMisMatch, in_msg.LineAddress, cache_entry, tbe);
+                        else if (((((in_msg.addr & 0x0000000000000020) >> 5) == 1) && cache_entry.Coh_mask[1] == true) || ((((address & 0x0000000000000020) >> 5) == 0) && cache_entry.Coh_mask[0] == true)) {
+                            trigger(Event:InvMMS, in_msg.LineAddress, cache_entry, tbe);
+                        }
+                        else {
+                            //InvMMI -> Invalidate with mismatch, transition to invalid state
+                            trigger(Event:InvMMI, in_msg.LineAddress, cache_entry, tbe);
+                        }
                     }
 
                     //trigger(Event:Inv, in_msg.addr, cache_entry, tbe);
@@ -702,6 +711,11 @@ machine(MachineType:L1Cache, "MSI cache")
         }
     }
 
+    action(copyMask, "c", desc="Update the mask in cache without changing state") {
+        assert(is_valid(cache_entry));
+        cache_entry.Coh_mask = in_msg.Coh_mask;
+    }
+
     action(allocateTBE, "aT", desc="Allocate TBE") {
         assert(is_invalid(tbe));
         TBEs.allocate(address);
@@ -817,7 +831,7 @@ machine(MachineType:L1Cache, "MSI cache")
         popResponseQueue;
     }
 
-    transition({S, SM_AD, SM_A, M}, LoadPass) {///////////////////////
+    transition({S, SM_AD, SM_A, M}, LoadPass) {///////////////////////SM_AD CHECK LATER
         loadHit;
         popMandatoryQueue;
     }
@@ -836,8 +850,18 @@ machine(MachineType:L1Cache, "MSI cache")
         popMandatoryQueue;
     }
 //////////////
-    transition(SS_D, {Load, Store, Replacement, Inv}) {////////////////////////////
-        stall;
+    transition(SS_D, {Load, Store, Replacement}) {////////////////////////////
+      stall;
+    }
+
+    transition(SS_D, InvMatch}) {////////////////////////////
+        sendInvAcktoReq;
+        popForwardQueue;
+    }
+
+    transition(SS_D, InvMisMatch, IS_D) {////////////////////////////
+        sendInvAcktoReq;
+        popForwardQueue;
     }
 
     // Similarly, on either DataDirNoAcks or DataOwner we should go to S
@@ -858,23 +882,29 @@ machine(MachineType:L1Cache, "MSI cache")
         sendPutS;
     }
 
-    transition(S, Inv, I) {
+    transition(S, InvMMS, S) {
+        sendInvAcktoReq;
+        copyMask;
+        popForwardQueue;
+    }
+
+    transition(S, InvMMI, I) {
         sendInvAcktoReq;
         forwardEviction;
         deallocateCacheBlock;
         popForwardQueue;
     }
 
-    transition({SM_AD, SM_A}, {Store, Replacement, FwdGetS, FwdGetM}) {
+    transition({SM_AD, SM_A}, {Store, LoadFail, Replacement, FwdGetS, FwdGetM}) {
         stall;
     }
 
-    transition(SM_AD, InvMisMatch, IM_AD) {
+    transition(SM_AD, InvMMI, IM_AD) {
         sendInvAcktoReq;
         popForwardQueue;
     }
 
-    transition(SM_AD, InvMatch) {
+    transition(SM_AD, InvMMS) {
         sendInvAcktoReq;
         popForwardQueue;
     }
@@ -900,3 +930,36 @@ machine(MachineType:L1Cache, "MSI cache")
         sendCacheDataToDir;
         popForwardQueue;
     }
+
+    transition(M, FwdGetM, I) {
+        sendCacheDataToReq;
+        deallocateCacheBlock;
+        popForwardQueue;
+    }
+
+    transition({MI_A, SI_A, II_A}, {Load, Store, Replacement}) {
+        stall;
+    }
+
+    transition(MI_A, FwdGetS, SI_A) {
+        sendCacheDataToReq;
+        sendCacheDataToDir;
+        popForwardQueue;
+    }
+
+    transition(MI_A, FwdGetM, II_A) {
+        sendCacheDataToReq;
+        popForwardQueue;
+    }
+
+    transition({MI_A, SI_A, II_A}, PutAck, I) {
+        deallocateCacheBlock;
+        popForwardQueue;
+    }
+
+    transition(SI_A, Inv, II_A) {
+        sendInvAcktoReq;
+        popForwardQueue;
+    }
+
+}
