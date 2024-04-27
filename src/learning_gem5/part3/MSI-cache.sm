@@ -105,6 +105,8 @@ machine(MachineType:L1Cache, "MSI cache")
 
         M,      AccessPermission:Read_Write,
                     desc="Modified. Read & write permissions. Owner of block";
+        M_coh1_A,    AccessPermission:Read_Write,
+                    desc="Modified. Read & write permissions. Owner of block";
 
         // States moving to Invalid
         MI_A,   AccessPermission:Busy,
@@ -126,6 +128,14 @@ machine(MachineType:L1Cache, "MSI cache")
 	LoadFail, 	desc="Load failed Coherence mask check";
         // Internal event (only triggered from processor requests)
         Replacement,    desc="Triggered when block is chosen as victim";
+
+        InvMatch,       desc="INV miss match check";
+
+        InvMisMatch,    desc="INV miss match check";
+
+        InvMMS,         desc="INV MMS vs MMI";
+
+        InvMMI,         desc="INV MMS vs MMI";
 
         // Forwarded reqeust from other cache via dir on the forward network
         FwdGetS,        desc="Directory sent us a request to satisfy GetS. ";
@@ -405,12 +415,13 @@ machine(MachineType:L1Cache, "MSI cache")
                         }
                     }
                     else {
-                        else if (((((in_msg.addr & 0x0000000000000020) >> 5) == 1) && cache_entry.Coh_mask[1] == true) || ((((address & 0x0000000000000020) >> 5) == 0) && cache_entry.Coh_mask[0] == true)) {
-                            trigger(Event:InvMMS, in_msg.LineAddress, cache_entry, tbe);
+                        //InvMMI -> Invalidate with mismatch, transition to invalid state. Handles in_msg.Coh_mas = 00 as well
+                        else if (((cache_entry.Coh_mask[1] == true) && (in_msg.Coh_mask[1] == False)) || ((cache_entry.Coh_mask[0] == true) && (in_msg.Coh_mask[0] == False))) {
+                            trigger(Event:InvMMI, in_msg.LineAddress, cache_entry, tbe);
                         }
                         else {
-                            //InvMMI -> Invalidate with mismatch, transition to invalid state
-                            trigger(Event:InvMMI, in_msg.LineAddress, cache_entry, tbe);
+                            //InvMMS -> Invalidate without mismatch, stay in S state
+                            trigger(Event:InvMMS, in_msg.LineAddress, cache_entry, tbe);
                         }
                     }
 
@@ -464,6 +475,15 @@ machine(MachineType:L1Cache, "MSI cache")
                     } else if (in_msg.Type == RubyRequestType:ST) {
                         trigger(Event:Store, in_msg.LineAddress, cache_entry,
                                 tbe);
+                     /***************************************************************/
+			if (((address & 0x0000000000000020) >> 5) == 1) && cache_entry.Coh_mask[1] == true) || ((address & 0x0000000000000020) >> 5) == 0) && cache_entry.Coh_mask[0] == true)) {
+                                        trigger(Event:StoreTRUE_Inv, in_msg.LineAddress, cache_entry,
+                                                tbe);
+                                }
+                                else {
+                                        trigger(Event:Storefalse, in_msg.LineAddress, cache_entry,
+                                                tbe);
+                                }
                     } else {
                         error("Unexpected type from processor");
                     }
@@ -520,7 +540,63 @@ machine(MachineType:L1Cache, "MSI cache")
             out_msg.Requestor := machineID;
         }
     }
+    
+    action(sendGetS_coh, 'gC', desc="Send GetS to the directory") {
+        // The syntax for enqueue is a lot like peek. Instead of populating
+        // in_msg, enqueue has an out_msg reference. Whatever you set on out_msg
+        // is sent through the out port specified.  "request_out" is the port
+        // we're sending the message out of "RequestMsg" is the type of message
+        // we're sending "1" is the latency (in cycles) the port waits before
+        // sending the message.
+        enqueue(request_out, RequestMsg, 1) {
+            out_msg.addr := address;
+            if (((address & 0x0000000000000020) >> 5) == 1) {
+                out_msg.Coh_mask = {cache_entry.Coh_mask[0], false}
+            }
+            else {
+                out_msg.Coh_mask = {false, cache_entry.Coh_mask[1]}
+            }
+            // This type is defined in MSI-msg.sm for this protocol.
+            out_msg.Type := CoherenceRequestType:GetS;
+            // The destination may change depending on the address striping
+            // across different directories, so query the network.
+            out_msg.Destination.add(mapAddressToMachine(address,
+                                    MachineType:Directory));
+            // See mem/ruby/protocol/RubySlicc_Exports.sm for possible sizes.
+            out_msg.MessageSize := MessageSizeType:Control;
+            // Set that the reqeustor is this machine so we get the response.
+            out_msg.Requestor := machineID;
+        }
+    }
 
+    action(update_coh, 'uC', desc="Send GetS to the directory") {
+        // The syntax for enqueue is a lot like peek. Instead of populating
+        // in_msg, enqueue has an out_msg reference. Whatever you set on out_msg
+        // is sent through the out port specified.  "request_out" is the port
+        // we're sending the message out of "RequestMsg" is the type of message
+        // we're sending "1" is the latency (in cycles) the port waits before
+        // sending the message.
+	    assert(is_valid(cache_entry));
+            if (((address & 0x0000000000000020) >> 5) == 1) {
+                cache_entry.Coh_mask = {cache_entry.Coh_mask[0], false}
+            }
+            else {
+                cache_entry.Coh_mask = {false, cache_entry.Coh_mask[1]}
+            }
+    } 
+
+
+    action(update_coh11, 'uC11', desc="Send GetS to the directory") {
+        // The syntax for enqueue is a lot like peek. Instead of populating
+        // in_msg, enqueue has an out_msg reference. Whatever you set on out_msg
+        // is sent through the out port specified.  "request_out" is the port
+        // we're sending the message out of "RequestMsg" is the type of message
+        // we're sending "1" is the latency (in cycles) the port waits before
+        // sending the message.
+            assert(is_valid(cache_entry));
+            cache_entry.Coh_mask = {true, true};
+    }
+    
     action(sendGetM, "gM", desc="Send GetM to the directory") {
         enqueue(request_out, RequestMsg, 1) {
             if (((address & 0x0000000000000020) >> 5) == 1) {
@@ -537,6 +613,19 @@ machine(MachineType:L1Cache, "MSI cache")
             out_msg.Requestor := machineID;
         }
     }
+
+    action(sendFullInv, "fI", desc="Send GetM to the directory") {
+        enqueue(request_out, RequestMsg, 1) {
+            out_msg.Coh_mask = {false, false}
+            out_msg.addr := address;
+            out_msg.Type := CoherenceRequestType:FullInv;
+            out_msg.Destination.add(mapAddressToMachine(address,
+                                    MachineType:Directory));
+            out_msg.MessageSize := MessageSizeType:Control;
+            out_msg.Requestor := machineID;
+        }
+    }
+
 
     // NOTE: Clean evict. Required to keep the directory state up-to-date
     action(sendPutS, "pS", desc="Send PutS to the directory") {
@@ -690,7 +779,7 @@ machine(MachineType:L1Cache, "MSI cache")
         }
     }
 
-    action(writeDataToCacheIS_D, "wd", desc="Write data to the cache") {
+    action(writeDataToCacheIS_D, "wIS_D", desc="Write data to the cache") {
         peek(response_in, ResponseMsg) {
             assert(is_valid(cache_entry));
             cache_entry.DataBlk := in_msg.DataBlk;
@@ -698,7 +787,7 @@ machine(MachineType:L1Cache, "MSI cache")
 	}
     }
 
-    action(writeDataToCacheAD_Owner, "wd", desc="Write data to the cache") {
+    action(writeDataToCacheAD_Owner, "wIAD", desc="Write data to the cache") {
         peek(response_in, ResponseMsg) {
             assert(is_valid(cache_entry));
             cache_entry.DataBlk := in_msg.DataBlk;
@@ -836,6 +925,11 @@ machine(MachineType:L1Cache, "MSI cache")
         popMandatoryQueue;
     }
 
+    transition(M, Load) {
+        loadHit;
+        popMandatoryQueue;
+    }
+
     transition(S, LoadFail, SS_D) {/////////////////////////////////
         // Make sure there is room in the cache to put the block whenever the
         // miss returns. Otherwise we could deadlock.
@@ -915,11 +1009,60 @@ machine(MachineType:L1Cache, "MSI cache")
         popResponseQueue;
     }
 
-    transition(M, Store) {
+   /*************************************************************/
+
+
+    transition(M, Storefalse) {////
         storeHit;
         forwardEviction;
         popMandatoryQueue;
     }
+
+    transition(M, StoreTRUE_Inv, M_coh1_A) {////edit coherence mask; send out out on forward eviction
+        storeHit;
+        forwardEviction;
+        //popMandatoryQueue;
+        update_coh;
+        allocateTBE;
+	    sendFullInv;//TODO
+    }
+
+    transition(M_coh1_A, DataDirNoAcks, M) {
+        deallocateTBE;
+        popResponseQueue;
+        popMandatoryQueue;
+    }
+
+    transition(M_coh1_A, InvAck) {
+        decrAcks;
+        popResponseQueue;
+    }
+
+    transition(M_coh1_A, LastInvAck, M) {
+        deallocateTBE;
+        popResponseQueue;
+        popMandatoryQueue;
+    }
+
+    transition(M_coh1_A, {Store, Replacement, FwdGetS, FwdGetM}) {
+        stall;
+    }
+
+    transition(M_coh1_A, Load) {
+        loadHit;
+        popMandatoryQueue;
+    }
+    
+    transition(M_coh1_A, InvMMI, IM_AD) {
+        sendInvAcktoReq;
+        popForwardQueue;
+    }
+
+    transition(M_coh1_A, InvMMS, SM_AD) {
+        sendInvAcktoReq;
+        popForwardQueue;
+    }
+///
 
     transition(M, Replacement, MI_A) {
         sendPutM;
@@ -928,16 +1071,23 @@ machine(MachineType:L1Cache, "MSI cache")
     transition(M, FwdGetS, S) {
         sendCacheDataToReq;
         sendCacheDataToDir;
+	update_coh11;
         popForwardQueue;
     }
 
-    transition(M, FwdGetM, I) {
+  //  transition(M, FwdGetM, I) {//update mask and go to S
+    //    sendCacheDataToReq;
+      //  deallocateCacheBlock;
+        //popForwardQueue;
+  //  }
+
+    transition(M, FwdGetM, S) {//update mask and go to S
         sendCacheDataToReq;
-        deallocateCacheBlock;
+        copyMask;
         popForwardQueue;
     }
 
-    transition({MI_A, SI_A, II_A}, {Load, Store, Replacement}) {
+    transition({MI_A, SI_A, II_A}, {Load, Store, Replacement}) {////////////
         stall;
     }
 
@@ -952,7 +1102,7 @@ machine(MachineType:L1Cache, "MSI cache")
         popForwardQueue;
     }
 
-    transition({MI_A, SI_A, II_A}, PutAck, I) {
+    transition({MI_A, SI_A, II_A}, PutAck, I) {///////
         deallocateCacheBlock;
         popForwardQueue;
     }

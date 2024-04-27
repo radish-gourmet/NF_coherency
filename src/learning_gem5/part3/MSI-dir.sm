@@ -109,6 +109,7 @@ machine(MachineType:Directory, "Directory protocol")
         // Data requests from the cache
         GetS,         desc="Request for read-only data from cache";
         GetM,         desc="Request for read-write data from cache";
+        FullInv,      desc="Invalidate all the sharers";
 
         // Writeback requests from the cache
         PutSNotLast,  desc="PutS and the block has other sharers";
@@ -251,6 +252,8 @@ machine(MachineType:Directory, "Directory protocol")
                     trigger(Event:GetS, in_msg.addr);
                 } else if (in_msg.Type == CoherenceRequestType:GetM) {
                     trigger(Event:GetM, in_msg.addr);
+                } else if (in_msg.Type == CoherencyRequestType:FullInv) {
+                    trigger(Event:FullInv, in_msg.addr);
                 } else if (in_msg.Type == CoherenceRequestType:PutS) {
                     assert(is_valid(entry));
                     // If there is only a single sharer (i.e., the requestor)
@@ -356,16 +359,51 @@ machine(MachineType:Directory, "Directory protocol")
         getDirectoryEntry(address).Sharers.clear();
     }
 
+    action(updateSharers, "cS", desc="Update the sharer list") {
+        peek(request_in, RequestMsg) {
+            //If the modifier is modifying both halves of the cache-line, then clear sharers list
+            if(in_msg.Coh_mask == {False, False}) {
+                getDirectoryEntry(address).Sharers.clear();
+            }
+            //If the modifier is modifying partial line, then send invalidation to all the sharers with the mask
+            else {
+                enqueue(forward_out, RequestMsg, 1) {
+                    out_msg.addr := address;
+                    out_msg.Coh_mas := in_msg.Coh_mask;
+                    out_msg.Type := CoherenceRequestType:Inv;
+                    out_msg.Requestor := in_msg.Requestor;
+                    out_msg.Destination := getDirectoryEntry(address).Sharers;
+                    out_msg.MessageSize := MessageSizeType:Control;
+                }
+            }
+        }
+    }
+
+
     action(clearOwner, "cO", desc="Clear the owner") {
         getDirectoryEntry(address).Owner.clear();
     }
 
     // Invalidates and forwards
 
+    action(sendFullInvToSharers, "i", desc="Send invalidate to all sharers") {
+        peek(request_in, RequestMsg) {
+            enqueue(forward_out, RequestMsg, 1) {
+                out_msg.addr := address;
+                out_msg.Coh_mask := {False, False};
+                out_msg.Type := CoherenceRequestType:Inv;
+                out_msg.Requestor := in_msg.Requestor;
+                out_msg.Destination := getDirectoryEntry(address).Sharers;
+                out_mssg.MessageSize := MessageSizeType:Control;
+            }
+        }
+    }
+
     action(sendInvToSharers, "i", desc="Send invalidate to all sharers") {
         peek(request_in, RequestMsg) {
             enqueue(forward_out, RequestMsg, 1) {
                 out_msg.addr := address;
+                out_msg.Coh_mask := in_msg.Coh_mask;
                 out_msg.Type := CoherenceRequestType:Inv;
                 out_msg.Requestor := in_msg.Requestor;
                 out_msg.Destination := getDirectoryEntry(address).Sharers;
@@ -379,6 +417,7 @@ machine(MachineType:Directory, "Directory protocol")
         peek(request_in, RequestMsg) {
             enqueue(forward_out, RequestMsg, 1) {
                 out_msg.addr := address;
+                out_msg.Coh_mask := in_msg.Coh_mask;
                 out_msg.Type := CoherenceRequestType:GetS;
                 out_msg.Requestor := in_msg.Requestor;
                 out_msg.Destination := getDirectoryEntry(address).Owner;
@@ -460,34 +499,41 @@ machine(MachineType:Directory, "Directory protocol")
     /*************************************************************************/
     // transitions
 
+    //Done
     transition({I, S}, GetS, S_m) {
         sendMemRead;
         addReqToSharers;
         popRequestQueue;
     }
 
+    //Done
     transition(I, {PutSNotLast, PutSLast, PutMNonOwner}) {
         sendPutAck;
         popRequestQueue;
     }
 
+    //Done
     transition(S_m, MemData, S) {
         sendDataToReq;
         popMemQueue;
     }
 
+    //Done
     transition(I, GetM, M_m) {
         sendMemRead;
         setOwner;
         popRequestQueue;
     }
 
+    //Done
     transition(M_m, MemData, M) {
         sendDataToReq;
-        clearSharers; // NOTE: This isn't *required* in some cases.
+        //clearSharers;     Don't clear the sharers.
         popMemQueue;
     }
 
+    //Done
+    //NOTE (assumption) : If any of the core has the line in M state, then dir has it in M state
     transition(S, GetM, M_m) {
         sendMemRead;
         removeReqFromSharers;
@@ -496,18 +542,22 @@ machine(MachineType:Directory, "Directory protocol")
         popRequestQueue;
     }
 
+    //Done
     transition({S, S_D, SS_m, S_m}, {PutSNotLast, PutMNonOwner}) {
         removeReqFromSharers;
         sendPutAck;
         popRequestQueue;
     }
 
+    //Done
     transition(S, PutSLast, I) {
         removeReqFromSharers;
         sendPutAck;
         popRequestQueue;
     }
 
+    //Done
+    //NOTE: it transitions to S state
     transition(M, GetS, S_D) {
         sendFwdGetS;
         addReqToSharers;
@@ -516,52 +566,73 @@ machine(MachineType:Directory, "Directory protocol")
         popRequestQueue;
     }
 
+    //Done
     transition(M, GetM) {
         sendFwdGetM;
+        sendInvToSharers;   //This is needed in case the new modifier is writing with different mask
+        addOwnerToSharers;
         clearOwner;
         setOwner;
+        //clearSharers      Don't clear sharers, can't do this deterministically
         popRequestQueue;
     }
 
+    //Done
     transition({M, M_m, MI_m}, {PutSNotLast, PutSLast, PutMNonOwner}) {
         sendPutAck;
         popRequestQueue;
     }
 
+    //Done
+    //NOTE: invalidating sharers for easiness and transitioning to I state
     transition(M, PutMOwner, MI_m) {
         sendDataToMem;
         clearOwner;
+        sendFullInvToSharers;
         sendPutAck;
         popRequestQueue;
     }
 
+    //Done
     transition(MI_m, MemAck, I) {
         popMemQueue;
     }
 
+    //Done
     transition(S_D, {GetS, GetM}) {
         stall;
     }
 
+    //Done
     transition(S_D, PutSLast) {
         removeReqFromSharers;
         sendPutAck;
         popRequestQueue;
     }
 
-    transition(S_D, Data, SS_m) {
+    //Done
+    transition(S_D, Data, SS_m) {   //The owner forwards data to requester.
         sendRespDataToMem;
         popResponseQueue;
     }
 
+    //Done
     transition(SS_m, MemAck, S) {
         popMemQueue;
     }
 
+    //Done
     // If we get another request for a block that's waiting on memory,
     // stall that request.
     transition({MI_m, SS_m, S_m, M_m}, {GetS, GetM}) {
         stall;
+    }
+
+    //Done
+    transition(M, FullInv, M) {
+        sendFullInvToSharers;
+        clearSharers;
+        popRequestQueue;
     }
 
 }
